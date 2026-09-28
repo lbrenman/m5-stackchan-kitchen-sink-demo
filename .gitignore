@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+
+# OS / editor clutter
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Local-only experiments and exports
+*.bak
+scratch/
