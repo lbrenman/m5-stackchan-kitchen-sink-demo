@@ -11,6 +11,7 @@
 #   App 2: Clock+Weather - time, date, current weather with drawn icons
 #   App 3: Battery       - voltage, current, power, charge estimate, power graph
 #   App 4: Audio         - microphone level meter / color spectrum
+#   App 5: Photo Frame   - random Unsplash photos every 30 s / 1 min / 5 min
 #
 # To add a new app: write a class that extends App (see TEMPLATE at the bottom
 # of the "APPS" section) and add it to the APPS list near the end of the file.
@@ -24,6 +25,8 @@ import lvgl as lv
 import time
 import math
 import array
+import json
+import gc
 import camera
 from hardware.stackchan import StackChan
 
@@ -74,6 +77,33 @@ SPECTRUM_HIGH_HZ = 6000
 SPECTRUM_RANGE = 3.5           # visible dynamic range (log10 power units, ~35 dB)
 SPECTRUM_MIN_REF = 9.5         # raise if bars dance in a quiet room
 LED_BRIGHTNESS = 0.5           # 0.0 .. 1.0 for the Colors mode LEDs
+
+# --- Photo frame (Unsplash) ---
+# EDIT THIS before running: your free Unsplash Access Key
+# (unsplash.com/developers -> Your apps -> New Application).
+# Don't commit your real key to a public repo.
+UNSPLASH_ACCESS_KEY = "YOUR-UNSPLASH-ACCESS-KEY"
+UNSPLASH_QUERY = ""                 # e.g. "nature" or "boston"; "" = any photo
+UNSPLASH_ORIENTATION = "landscape"  # "landscape", "portrait", "squarish" or ""
+UNSPLASH_CONTENT_FILTER = "high"    # "high" = strictest safe-content filter
+# Photos fetched per API call (1..30). Demo keys allow 50 calls/hour; with 10
+# per call, even the 30 s interval uses only 12 calls/hour.
+PHOTO_BATCH = 10
+# Which URL in each photo record to show, and how to size it. Unsplash image
+# URLs accept resize parameters. PNG, because Unsplash's JPEGs are progressive,
+# which the device can't decode.
+PHOTO_URL_FIELD = ("urls", "raw")
+PHOTO_SIZE_PARAMS = "w=320&h=240&fit=crop&crop=entropy&fm=png"
+PHOTO_INTERVALS = (("30 s", 30 * 1000), ("1 min", 60 * 1000), ("5 min", 5 * 60 * 1000))
+PHOTO_DEFAULT_INTERVAL = 1          # index into PHOTO_INTERVALS (1 = "1 min")
+PHOTO_RETRY_MS = 60 * 1000          # retry delay after an error
+PHOTO_RATE_LIMIT_RETRY_MS = 10 * 60 * 1000
+PHOTO_REPUSH_MS = 5000              # re-copy the photo to the screen this often
+
+# --- StackChan body ---
+# At power-up (Run Always / Download) the body can be slow to appear on I2C.
+BODY_INIT_TRIES = 6
+BODY_INIT_WAIT_MS = 500
 
 # --- Navigation ---
 SWIPE_ANIM_MS = 250
@@ -1166,6 +1196,425 @@ class AudioApp(App):
 
 
 # =============================================================================
+# APP 5: PHOTO FRAME (random Unsplash photos on a timer)
+# =============================================================================
+# Why this app draws with M5GFX (M5.Lcd) instead of LVGL:
+# On this firmware LVGL has no image cache, so it decodes an image again on
+# EVERY redraw: a 320x240 PNG took ~54 s per redraw. Unsplash's JPEGs are
+# progressive, which LVGL can't decode at all. M5GFX decodes the same PNG in
+# ~250 ms. So the photo is decoded ONCE into an off-screen canvas (PSRAM),
+# the buttons/credit/page dots are drawn onto that canvas too, and the canvas
+# is copied to the screen with push(). Nothing LVGL draws is visible on this
+# page. Taps come from LVGL press/release events on the page (with their
+# coordinates) and are checked against the drawn buttons. Swipes still go
+# through LVGL's page gesture, like every other app.
+
+class PhotoError(Exception):
+    pass
+
+
+class RateLimited(PhotoError):
+    pass
+
+
+def http_get(url, headers=None):
+    """GET a URL. Returns (status, body bytes). Unlike http_get_json, this
+    keeps the status code so 401 / 403 can be reported clearly."""
+    try:
+        import requests2 as rq
+    except ImportError:
+        try:
+            import urequests as rq
+        except ImportError:
+            import requests as rq
+    r = rq.get(url, headers=headers or {})
+    try:
+        status = getattr(r, "status_code", 200)
+        body = r.content
+    finally:
+        r.close()
+    return status, body
+
+
+def url_quote(s):
+    """Percent-encode a query value (MicroPython has no urllib.parse)."""
+    out = []
+    for ch in s:
+        if ("a" <= ch <= "z") or ("A" <= ch <= "Z") or ("0" <= ch <= "9") or ch in "-_.~":
+            out.append(ch)
+        else:
+            out.append("".join("%%%02X" % b for b in ch.encode()))
+    return "".join(out)
+
+
+def dig(d, path):
+    """dig(photo, ("user", "name")) -> photo["user"]["name"], or None."""
+    for k in path:
+        if not isinstance(d, dict):
+            return None
+        d = d.get(k)
+    return d
+
+
+def touch_point():
+    """Current touch position as (x, y), from LVGL's input device."""
+    indev = active_indev()
+    if indev is not None:
+        try:
+            p = lv.point_t()
+            indev.get_point(p)
+            return (p.x, p.y)
+        except Exception as e:
+            print("indev.get_point failed:", e)
+    try:
+        return (M5.Touch.getX(), M5.Touch.getY())
+    except Exception:
+        return None
+
+
+class PhotoFrameApp(App):
+    """Shows random Unsplash photos full screen. Three buttons pick how
+    often the photo changes. Photos are fetched PHOTO_BATCH at a time (one
+    API call) and shown one by one, which keeps demo keys under their
+    50 calls/hour limit."""
+
+    NAME = "Photos"
+    BG = 0x000000
+
+    BTN_W = 56
+    BTN_H = 28
+    BTN_Y = 4
+    BTN_ON = 0x1E88E5
+    BTN_OFF = 0x263040
+    TAP_SLOP = 15           # px a finger may move and still count as a tap
+
+    def build(self, page):
+        self.canvas = None
+        try:
+            self.canvas = M5.Lcd.newCanvas(SCREEN_W, SCREEN_H, 16, True)   # PSRAM
+        except Exception as e:
+            print("Photo canvas failed:", e)
+        self.font_s = getattr(M5.Lcd.FONTS, "Montserrat12", None)
+        self.font_m = getattr(M5.Lcd.FONTS, "Montserrat14", None)
+        self.font_l = getattr(M5.Lcd.FONTS, "Montserrat16", None)
+
+        n = len(PHOTO_INTERVALS)
+        self.btn_rects = [
+            (SCREEN_W - (n - i) * (self.BTN_W + 4), self.BTN_Y, self.BTN_W, self.BTN_H)
+            for i in range(n)
+        ]
+
+        self.interval_i = PHOTO_DEFAULT_INTERVAL
+        self.png = None                 # bytes of the photo on screen
+        self.credit = ""
+        self.message = ""               # big centred text when there's no photo
+        self.status = ""                # small badge (errors) over the photo
+        self.queue = []                 # (image url, photographer) not shown yet
+        self.last_change = None
+        self.retrying = False
+        self.visible = False
+        self.next_change = time.ticks_ms()
+        self.repaint_at = None
+        self.last_push = time.ticks_ms()
+        self.press = None               # (x, y) where the current touch began
+        self.press_moved = False
+        self.pending_tap = None         # (x, y) of a tap, handled in tick()
+        page.add_event_cb(self.on_page_event, lv.EVENT.ALL, None)
+
+        remove_old_photo_files()
+        if self.canvas is None:
+            self.message = "Not enough memory for the photo"
+        elif self.placeholder_key():
+            self.message = "Set UNSPLASH_ACCESS_KEY in CONFIG"
+        else:
+            self.message = "Loading photo..."
+        self.compose()
+
+    # --- lifecycle -------------------------------------------------------
+    def on_enter(self):
+        self.visible = True
+        now = time.ticks_ms()
+        # LVGL draws this (empty) page during the slide animation; copy the
+        # photo over it once the animation has finished.
+        self.repaint_at = time.ticks_add(now, SWIPE_ANIM_MS + 150)
+        if self.png is None or time.ticks_diff(now, self.next_change) >= 0:
+            self.next_change = time.ticks_add(now, SWIPE_ANIM_MS + 400)
+
+    def on_exit(self):
+        self.visible = False
+        self.repaint_at = None
+        self.press = None
+        self.pending_tap = None
+
+    def tick(self):
+        now = time.ticks_ms()
+        if self.repaint_at is not None and time.ticks_diff(now, self.repaint_at) >= 0:
+            self.repaint_at = None
+            self.repaint()
+        elif time.ticks_diff(now, self.last_push) >= PHOTO_REPUSH_MS:
+            self.repaint()              # cheap insurance if LVGL drew over us
+        if self.pending_tap is not None:
+            x, y = self.pending_tap
+            self.pending_tap = None
+            print("Photos: tap at", x, y)
+            self.on_tap(x, y)
+        if self.repaint_at is None and time.ticks_diff(now, self.next_change) >= 0:
+            self.change_photo()
+
+    # --- drawing ---------------------------------------------------------
+    def repaint(self):
+        """Copy the composed canvas to the screen (~30 ms)."""
+        self.last_push = time.ticks_ms()
+        if not self.visible or self.canvas is None:
+            return
+        try:
+            lv.refr_now(None)           # let LVGL finish anything pending first
+        except Exception:
+            pass
+        self.canvas.push(0, 0)
+
+    def text(self, s, x, y, fg, bg, font):
+        c = self.canvas
+        if font is not None:
+            try:
+                c.setFont(font)
+            except Exception:
+                pass
+        c.setTextColor(fg, bg)
+        c.drawString(s, int(x), int(y))
+
+    def text_w(self, s, font):
+        try:
+            if font is not None:
+                self.canvas.setFont(font)
+            return self.canvas.textWidth(s)
+        except Exception:
+            return len(s) * 8           # rough fallback
+
+    def badge(self, s, x, y, font):
+        """White text on a dark rounded box, readable over any photo."""
+        w = self.text_w(s, font) + 10
+        self.canvas.fillRoundRect(int(x), int(y), int(w), 20, 4, 0x000000)
+        self.text(s, x + 5, y + 3, 0xFFFFFF, 0x000000, font)
+
+    def compose(self):
+        """Build the whole frame on the canvas: photo, buttons, credit,
+        status and page dots. Decoding the PNG takes ~250 ms."""
+        c = self.canvas
+        if c is None:
+            return
+        drawn = False
+        if self.png is not None:
+            try:
+                c.drawPng(self.png, 0, 0)
+                drawn = True
+            except Exception as e:
+                print("drawPng failed:", e)
+                self.status = "Can't draw this photo"
+        if not drawn:
+            c.fillRect(0, 0, SCREEN_W, SCREEN_H, 0x000000)
+            if self.message:
+                w = self.text_w(self.message, self.font_l)
+                self.text(self.message, (SCREEN_W - w) // 2, 110, 0xB3C7E6, 0x000000, self.font_l)
+
+        for i, (x, y, w, h) in enumerate(self.btn_rects):
+            color = self.BTN_ON if i == self.interval_i else self.BTN_OFF
+            c.fillRoundRect(x, y, w, h, 6, color)
+            name = PHOTO_INTERVALS[i][0]
+            tw = self.text_w(name, self.font_m)
+            self.text(name, x + (w - tw) // 2, y + 7, 0xFFFFFF, color, self.font_m)
+
+        if drawn and self.credit:
+            self.badge(self.credit, 4, 212, self.font_s)
+        if self.status:
+            self.badge(self.status, 4, 38, self.font_m)
+        self.draw_dots()
+
+    def draw_dots(self):
+        """Same page dots the manager draws with LVGL (they're hidden
+        under the canvas on this page)."""
+        try:
+            idx = self.mgr.apps.index(self)
+            count = len(self.mgr.apps)
+        except Exception:
+            return
+        d, gap = 6, 8
+        x = (SCREEN_W - (count * d + (count - 1) * gap)) // 2
+        for i in range(count):
+            color = 0xFFFFFF if i == idx else 0x6A6A6A
+            self.canvas.fillCircle(x + d // 2, 229 + d // 2, d // 2, color)
+            x += d + gap
+
+    def show_busy(self):
+        """Draw a 'Loading' badge on the current frame without re-decoding."""
+        if self.canvas is None or self.png is None:
+            return
+        self.badge("Loading...", 4, 38, self.font_m)
+        self.repaint()
+
+    # --- touch --------------------------------------------------------
+    # LVGL already reads the touchscreen (M5.Touch didn't see taps while m5ui
+    # was running), so use the page's own press/release events. This runs
+    # inside an LVGL callback: only record the tap; tick() acts on it.
+    def on_page_event(self, e):
+        code = event_code(e)
+        if code == lv.EVENT.PRESSED:
+            self.press = touch_point()
+            self.press_moved = False
+        elif self.press is None:
+            return
+        elif code == lv.EVENT.PRESSING:
+            pt = touch_point()
+            if pt and (abs(pt[0] - self.press[0]) > self.TAP_SLOP
+                       or abs(pt[1] - self.press[1]) > self.TAP_SLOP):
+                self.press_moved = True            # a swipe, not a tap
+        elif code == lv.EVENT.GESTURE:
+            self.press_moved = True
+        elif code in (lv.EVENT.RELEASED, lv.EVENT.PRESS_LOST):
+            if code == lv.EVENT.RELEASED and not self.press_moved:
+                self.pending_tap = self.press
+            self.press = None
+
+    def on_tap(self, x, y):
+        s = 6                                      # a little extra around each button
+        for i, (bx, by, bw, bh) in enumerate(self.btn_rects):
+            if bx - s <= x < bx + bw + s and by - s <= y < by + bh + s:
+                if i != self.interval_i:
+                    self.set_interval(i)
+                return
+
+    def set_interval(self, i):
+        self.interval_i = i
+        self.compose()
+        self.repaint()
+        if self.last_change is None or self.retrying:
+            return                      # keep the pending first load / retry
+        # The new interval counts from when the current photo appeared
+        now = time.ticks_ms()
+        target = time.ticks_add(self.last_change, PHOTO_INTERVALS[i][1])
+        if time.ticks_diff(target, now) < 1000:
+            target = time.ticks_add(now, 1000)
+        self.next_change = target
+
+    # --- photos ----------------------------------------------------------
+    @staticmethod
+    def placeholder_key():
+        return "YOUR-" in UNSPLASH_ACCESS_KEY or not UNSPLASH_ACCESS_KEY
+
+    def change_photo(self):
+        if self.canvas is None or self.placeholder_key():
+            self.next_change = time.ticks_add(time.ticks_ms(), PHOTO_RETRY_MS)
+            return
+        if not wifi_connected():
+            self.fail("No Wi-Fi", PHOTO_RETRY_MS)
+            return
+
+        self.show_busy()
+        try:
+            if not self.queue:
+                self.queue = self.fetch_batch()
+            if not self.queue:
+                raise PhotoError("Unsplash returned no photos")
+            url, who = self.queue.pop(0)
+            png = self.download(url)    # keep the old photo until this works
+            self.png = None
+            gc.collect()
+            self.png = png
+            self.credit = "%s / Unsplash" % who[:22]
+            self.message = ""
+            self.status = ""
+            self.retrying = False
+            self.last_change = time.ticks_ms()
+            self.next_change = time.ticks_add(self.last_change, PHOTO_INTERVALS[self.interval_i][1])
+        except RateLimited as e:
+            print("Unsplash:", e)
+            self.fail("Rate limit reached, waiting", PHOTO_RATE_LIMIT_RETRY_MS)
+            return
+        except Exception as e:
+            try:
+                sys.print_exception(e)
+            except Exception:
+                print("Photo failed:", e)
+            self.fail("Error: %s" % (str(e) or type(e).__name__)[:30], PHOTO_RETRY_MS)
+            return
+        t0 = time.ticks_ms()
+        self.compose()
+        self.repaint()
+        print("Photo shown (%d bytes, compose+push %d ms)"
+              % (len(self.png), time.ticks_diff(time.ticks_ms(), t0)))
+        gc.collect()
+
+    def fail(self, text, retry_ms):
+        self.retrying = True
+        if self.png is None:
+            self.message = text
+            self.status = ""
+        else:
+            self.status = text          # keep showing the last photo
+        self.compose()
+        self.repaint()
+        self.next_change = time.ticks_add(time.ticks_ms(), retry_ms)
+
+    def api_url(self):
+        url = "https://api.unsplash.com/photos/random?count=%d&content_filter=%s" % (
+            clamp(PHOTO_BATCH, 1, 30), UNSPLASH_CONTENT_FILTER)
+        if UNSPLASH_ORIENTATION:
+            url += "&orientation=" + UNSPLASH_ORIENTATION
+        if UNSPLASH_QUERY:
+            url += "&query=" + url_quote(UNSPLASH_QUERY)
+        return url
+
+    def fetch_batch(self):
+        """One API call -> list of (sized image url, photographer name)."""
+        status, body = http_get(self.api_url(), {
+            "Authorization": "Client-ID " + UNSPLASH_ACCESS_KEY,
+            "Accept-Version": "v1",
+        })
+        if status == 401:
+            raise PhotoError("key rejected (401)")
+        if status == 403 and b"rate limit" in body.lower():
+            raise RateLimited(body[:80])
+        if status != 200:
+            raise PhotoError("Unsplash HTTP %d" % status)
+        data = json.loads(body.decode())
+        body = None
+        photos = data if isinstance(data, list) else [data]   # count=N -> list
+        out = []
+        for p in photos:
+            raw = dig(p, PHOTO_URL_FIELD)
+            if not isinstance(raw, str):
+                continue
+            url = raw
+            if PHOTO_SIZE_PARAMS:
+                url += ("&" if "?" in raw else "?") + PHOTO_SIZE_PARAMS
+            out.append((url, dig(p, ("user", "name")) or "Unknown"))
+        print("Unsplash: got %d photos" % len(out))
+        return out
+
+    @staticmethod
+    def download(url):
+        status, body = http_get(url)
+        if status != 200:
+            raise PhotoError("image HTTP %d" % status)
+        if body[:4] != b"\x89PNG":
+            raise PhotoError("not a PNG")
+        return body
+
+
+def remove_old_photo_files():
+    """Earlier versions of this app (and the photo tests) saved photos in
+    /flash/res/img. This version keeps them in memory, so tidy those up."""
+    d = "/flash/res/img"
+    try:
+        for name in os.listdir(d):
+            if name.startswith("unsplash_") and (name.endswith(".jpg") or name.endswith(".png")):
+                os.remove(d + "/" + name)
+                print("Removed old", name)
+    except OSError:
+        pass
+
+
+# =============================================================================
 # TEMPLATE for your next app (copy, rename, add to APPS)
 # =============================================================================
 # class MyApp(App):
@@ -1188,6 +1637,18 @@ class AudioApp(App):
 # =============================================================================
 # APP MANAGER (swipe navigation, page dots, shared hardware, main loop)
 # =============================================================================
+class NoBody:
+    """Stand-in for StackChan when the robot body isn't found: every
+    method call does nothing and returns None, so apps keep running
+    (LEDs/servos do nothing, battery readings show --)."""
+
+    SERVO_ID_X = 0
+    SERVO_ID_Y = 1
+
+    def __getattr__(self, name):
+        return lambda *args, **kwargs: None
+
+
 class AppManager:
     def __init__(self, app_classes):
         self.apps = [cls(self) for cls in app_classes]
@@ -1218,9 +1679,22 @@ class AppManager:
         self.apps[0].on_enter()
 
     def init_hardware(self):
-        self.stackchan = StackChan(i2c=1, uart=1)
+        self.stackchan = None
+        self.has_body = False
+        for attempt in range(1, BODY_INIT_TRIES + 1):
+            try:
+                self.stackchan = StackChan(i2c=1, uart=1)
+                self.has_body = True
+                break
+            except Exception as e:
+                print("StackChan body not found (try %d/%d): %s" % (attempt, BODY_INIT_TRIES, e))
+                time.sleep_ms(BODY_INIT_WAIT_MS)
         Speaker.begin()
         Speaker.setVolumePercentage(VOLUME)
+        if not self.has_body:
+            print("Continuing WITHOUT the StackChan body (no LEDs, servos or battery data)")
+            self.stackchan = NoBody()
+            return
         sc = self.stackchan
         sc.set_rgb_color(0x000000)
         sc.set_servo_power(enable=True)
@@ -1299,6 +1773,7 @@ APPS = [
     ClockWeatherApp,
     BatteryApp,
     AudioApp,
+    PhotoFrameApp,
     # MyApp,
 ]
 

@@ -10,6 +10,7 @@ Swipe **left** for the next app and **right** for the previous one. It wraps aro
 | 2 | **Clock + Weather** | Large clock and date, plus current conditions with drawn weather icons: temperature, high/low, feels-like, humidity, and wind |
 | 3 | **Battery** | Charge gauge (estimated from voltage), voltage, current, power, charging status, and a 60-second power graph |
 | 4 | **Audio** | Live microphone visuals with two modes chosen from buttons along the top: **Meter** and **Colors** |
+| 5 | **Photo Frame** | Random photos from [Unsplash](https://unsplash.com), full screen, with the photographer credited. Three buttons choose how often the photo changes: **30 s**, **1 min**, or **5 min** |
 
 ---
 
@@ -24,6 +25,8 @@ Swipe **left** for the next app and **right** for the previous one. It wraps aro
 * Audio
   ![image](images/AudioLevel.jpg)
   ![image](images/AudioMeter.jpg)
+* Photo Frame
+  ![image](images/PhotoFrame.jpg)
 
 ## Tested on
 
@@ -33,19 +36,28 @@ Swipe **left** for the next app and **right** for the previous one. It wraps aro
 | **Firmware** | UIFlow2.0 for StackChan v2.5.3, flashed with M5Burner |
 | **IDE** | UiFlow2 web IDE ([uiflow2.m5stack.com](https://uiflow2.m5stack.com)), Python code view |
 
-Kitchen Sink Demo uses the StackChan-specific `hardware.stackchan` driver, so it won't run unchanged on a plain CoreS3 without the StackChan body.
+Kitchen Sink Demo uses the StackChan-specific `hardware.stackchan` driver. If the body isn't found at startup, the app still runs, but LEDs, servos and battery readings do nothing (see Troubleshooting).
+
+> **Photo Frame's final design (M5GFX canvas) is not yet tested end to end.** The pieces it relies on were measured on the device (see [Photo Frame app](#photo-frame-app)); the first-run checklist there says what to watch for.
 
 ## Requirements
 
 - StackChan flashed with **UIFlow2.0 for StackChan** (tested against the 2.5.x API)
-- Wi-Fi configured in UIFlow2, which the clock and weather need. Controls works offline.
-- No API keys. Weather comes from [Open-Meteo](https://open-meteo.com/), which is free and needs no signup.
+- Wi-Fi configured in UIFlow2, which the clock, weather and photo frame need. Controls works offline.
+- Weather needs no API key. It comes from [Open-Meteo](https://open-meteo.com/), which is free and needs no signup.
+- The photo frame needs a free **Unsplash Access Key**. Sign up at [unsplash.com/developers](https://unsplash.com/developers), create an application under **Your apps**, and copy its **Access Key** (not the Secret Key). New apps are in demo mode, which allows 50 API calls per hour; the app stays well under that.
 
 ## Run it
 
 1. Open [uiflow2.m5stack.com](https://uiflow2.m5stack.com) and connect to your StackChan.
 2. Create a new project, switch to the **Python** code view, and paste in all of `kitchen-sink-demo.py`.
-3. Edit the **CONFIG** section at the top (see below).
+3. Edit the **CONFIG** section at the top (see below). For the photo frame, replace the placeholder:
+
+   ```python
+   UNSPLASH_ACCESS_KEY = "YOUR-UNSPLASH-ACCESS-KEY"
+   ```
+
+   Until you do, the Photos app shows "Set UNSPLASH_ACCESS_KEY in CONFIG" and makes no requests. Keep your real key out of the repo (for example in a `*.local.py` copy, which `.gitignore` excludes).
 4. Click **Run Once** to test. Click **Download** to make it the program that runs at boot.
 
 ## Configuration
@@ -73,6 +85,18 @@ All settings are in the `CONFIG` block at the top of the file.
 | `SPECTRUM_RANGE` | `3.5` | Dynamic range of the bars. Lower it for more movement, raise it for less. |
 | `SPECTRUM_MIN_REF` | `9.5` | Noise gate for the bars. Raise it if they dance in a quiet room. |
 | `LED_BRIGHTNESS` | `0.5` | Brightness of the LEDs in Colors mode. |
+| `UNSPLASH_ACCESS_KEY` | `YOUR-UNSPLASH-ACCESS-KEY` | **Required for Photos.** Your Unsplash Access Key, sent as `Authorization: Client-ID ...`. |
+| `UNSPLASH_QUERY` | `""` | Limit photos to a search term, e.g. `"nature"` or `"boston"`. Empty means any photo. |
+| `UNSPLASH_ORIENTATION` | `landscape` | `landscape`, `portrait`, `squarish`, or `""`. Landscape crops best to the 320×240 screen. |
+| `UNSPLASH_CONTENT_FILTER` | `high` | Unsplash's safe-content filter. `high` is the strictest. |
+| `PHOTO_BATCH` | `10` | Photos fetched per API call (1–30). See [Staying under the rate limit](#staying-under-the-rate-limit). |
+| `PHOTO_URL_FIELD` | `("urls", "raw")` | Which URL in each photo record to display. |
+| `PHOTO_SIZE_PARAMS` | `w=320&h=240&fit=crop&crop=entropy&fm=png` | Resize parameters appended to that URL, so Unsplash sends a screen-sized **PNG**. Don't switch to `fm=jpg`: Unsplash's JPEGs are progressive and won't decode. |
+| `PHOTO_INTERVALS` | 30 s / 1 min / 5 min | Button labels and times. Change them freely; three buttons fit across the top right. |
+| `PHOTO_DEFAULT_INTERVAL` | `1` | Which interval is selected at startup (index into `PHOTO_INTERVALS`; 1 = "1 min"). |
+| `PHOTO_RETRY_MS` / `PHOTO_RATE_LIMIT_RETRY_MS` | 60 s / 10 min | Wait after an error, and after hitting the Unsplash rate limit. |
+| `PHOTO_REPUSH_MS` | `5000` | How often the photo is copied to the screen again, in case something drew over it. |
+| `BODY_INIT_TRIES` / `BODY_INIT_WAIT_MS` | `6` / `500` | How many times to look for the StackChan body at startup, and the wait between tries. At power-up the body can be slow to appear. |
 | `SWIPE_ANIM_MS` | `250` | Length of the slide animation between apps. |
 
 ---
@@ -85,6 +109,7 @@ AppManager                      owns hardware, pages, swipe navigation, main loo
  ├─ ClockWeatherApp(App)        app 2
  ├─ BatteryApp(App)             app 3
  ├─ AudioApp(App)               app 4
+ ├─ PhotoFrameApp(App)          app 5
  └─ ...your apps(App)           add to the APPS list
 ```
 
@@ -144,6 +169,85 @@ An oscilloscope mode was tried and removed. Redrawing a full LVGL line chart man
 
 The LEDs turn off when you switch away from Colors mode or leave the app.
 
+### Photo Frame app
+
+The Photos app shows a random Unsplash photo full screen and changes it on a timer. The three buttons at the top right (**30 s**, **1 min**, **5 min**) choose the interval; the selected one is blue. The photographer's name and "Unsplash" appear at the bottom left, which Unsplash's API guidelines require. The photo only changes while the app is on screen, so it doesn't use API calls in the background.
+
+Unlike the other apps, **Photos draws with M5GFX (`M5.Lcd`), not LVGL.** The next section explains why.
+
+#### Why not LVGL (what the device tests showed)
+
+The first version showed the photo with m5ui's `M5Image`. It displayed nothing but a blue screen. A series of test programs on the device found three problems:
+
+| Test | Result |
+|---|---|
+| Unsplash JPEG with `fm=jpg` | Unsplash sends a **progressive** JPEG. LVGL's decoder (TJpgDec) only reads baseline JPEGs, so decoding failed (image size 0 × 0). |
+| Same photo as PNG (`fm=png`) through LVGL | Decoded correctly, but **one full-screen redraw took about 54 seconds**. |
+| `lv.image_cache_resize()` | **Not available** in this firmware. With no image cache, LVGL decodes the whole image again on every redraw, and it redraws in strips. Even a 32 × 32 JPEG took about 450 ms per full redraw. |
+| Same PNG with M5GFX `M5.Lcd.drawPng()` | **About 250 ms.** |
+
+So the app downloads the photo as PNG and uses M5GFX to decode it.
+
+#### How it draws
+
+1. `build()` creates one off-screen canvas, `M5.Lcd.newCanvas(320, 240, 16, True)`, which is 150 KB in PSRAM.
+2. When a new photo arrives, `compose()` decodes the PNG bytes onto the canvas with `canvas.drawPng(png_bytes, 0, 0)`. `drawPng` accepts the data directly, so **nothing is written to flash**. Then it draws the interval buttons, the credit, any status message, and the page dots on top.
+3. `repaint()` copies the canvas to the screen with `canvas.push(0, 0)`, which takes about 30 ms. It first calls `lv.refr_now()` so that LVGL finishes any pending drawing and doesn't paint over the photo afterwards.
+
+When you swipe to Photos, LVGL slides in the page, which is empty except for its page dots. The app then pushes the canvas once the slide animation has finished. It also pushes the canvas again every `PHOTO_REPUSH_MS` (5 s) in case anything drew over it. Pushing identical pixels isn't visible.
+
+Changing the interval re-composes the canvas, which decodes the PNG again (about 250 ms). The PNG bytes of the current photo stay in memory for this.
+
+#### How taps and swipes work on this page
+
+The buttons are drawn pixels, not LVGL widgets, because anything LVGL draws would cover the photo. The first try read taps with `M5.Touch`, but it never saw them while m5ui was running (LVGL reads the touchscreen on its own timer). So the app listens to the page's own LVGL events instead:
+
+- `PRESSED` records where the finger went down, using `lv.indev_active().get_point()`.
+- `PRESSING` marks the touch as a swipe once it moves more than 15 px, and so does a `GESTURE` event.
+- `RELEASED` without movement counts as a tap. The callback only stores the position; `tick()` then checks whether it hit a button and redraws. Redrawing isn't done inside the LVGL callback.
+
+Each tap prints `Photos: tap at X Y` to the console. Swipes work the same as in every other app.
+
+M5Stack advises against mixing M5GFX and LVGL on the same screen. It's contained here: on this page LVGL only draws the empty page during the slide animation, and all visible pixels come from the canvas. The Controls app's photo does something similar.
+
+#### Each photo change, step by step
+
+1. If the queue of unseen photos is empty, call `GET https://api.unsplash.com/photos/random?count=10&content_filter=high&orientation=landscape` with the header `Authorization: Client-ID <key>`. With `count`, the reply is a JSON **array** of photo records (the app also accepts a single object).
+2. Take the next photo from the queue and download it from `images.unsplash.com` as a 320×240 PNG (about 70–100 KB).
+3. Decode it onto the canvas and push it to the screen. If the download fails, the previous photo stays on screen.
+
+**Which image is shown.** Each photo record has several URLs. `profile_image.small` is the photographer's 32×32 avatar, not the photo, so the app uses `urls.raw` and appends `PHOTO_SIZE_PARAMS`. Unsplash's image CDN then returns the photo cropped to exactly 320×240, around its most interesting area.
+
+Fields the app reads from each record:
+
+```json
+{
+  "urls": { "raw": "https://images.unsplash.com/photo-...?ixid=...&ixlib=rb-4.1.0" },
+  "user": { "name": "T Y" }
+}
+```
+
+On startup, the app deletes any `unsplash_*.jpg` / `unsplash_*.png` files left in `/flash/res/img` by the earlier version and by the test programs.
+
+#### Staying under the rate limit
+
+Demo Unsplash keys allow **50 API calls per hour**. Only `api.unsplash.com` calls count; downloading images from `images.unsplash.com` doesn't. Fetching `PHOTO_BATCH` photos per call keeps usage low:
+
+| Interval | Photos per hour | API calls per hour (`PHOTO_BATCH = 10`) |
+|---|---|---|
+| 30 s | 120 | 12 |
+| 1 min | 60 | 6 |
+| 5 min | 12 | ~1–2 |
+
+If the limit is hit anyway (for example, several devices sharing one key), Unsplash answers `403 Rate Limit Exceeded`. The app keeps the current photo, shows "Rate limit reached, waiting", and tries again after `PHOTO_RATE_LIMIT_RETRY_MS`.
+
+#### First run checklist
+
+- **Console:** look for `Unsplash: got 10 photos`, then `Photo shown (NNNNN bytes, compose+push NNN ms)`. The time should be around 300 ms.
+- **Buttons:** tapping 30 s / 1 min / 5 min should print `Photos: tap at X Y` and move the blue highlight within about a quarter of a second. The buttons are at the top right, roughly x 140–316 and y 4–32.
+- **Swipes:** swiping left or right on the photo should still change apps. After you swipe back to Photos, the photo should reappear about a quarter-second after the slide ends.
+- **Black patches or a blank page:** if these appear over the photo, LVGL drew over it. It should fix itself within `PHOTO_REPUSH_MS`. If it doesn't, check the console.
+
 ---
 
 ## Adding a new app
@@ -201,11 +305,23 @@ To give an app several views, as the Audio app does, put each view in its own `c
 | **Colors mode feels sticky or taps are ignored** | Raise the Colors value in `AUDIO_MIN_FRAME_MS` (for example to `100`). |
 | **Power graph stays flat** | Chart function names vary between LVGL builds. `chart_set_all()` falls back to `set_next_value()` automatically; check the console for errors. |
 | **Colors mode feels slow** | The Goertzel math runs in plain Python. Lower `SPECTRUM_SAMPLES` to `192` or `128`. |
+| **Photos says "Set UNSPLASH_ACCESS_KEY in CONFIG"** | The placeholder is still in the file. Paste in your Unsplash Access Key. |
+| **"Error: key rejected (401)"** | The key is wrong, the placeholder is back (for example after pasting a fresh copy of the file), or you used the Secret Key. Use the **Access Key** from your Unsplash app page. |
+| **"Rate limit reached, waiting"** | The key used its 50 calls this hour. The app retries after 10 min. Raise `PHOTO_BATCH` if it keeps happening. |
+| **"Error: not a PNG"** | `PHOTO_SIZE_PARAMS` no longer asks for `fm=png`. Put it back; Unsplash's JPEGs are progressive and can't be decoded here. |
+| **A plain blue or blank screen instead of the photo** | That's what LVGL's image widget showed. This version doesn't use it; make sure you're running the latest `kitchen-sink-demo.py`. |
+| **Black patches over the photo** | LVGL drew over the canvas. It's repainted within `PHOTO_REPUSH_MS`; lower it (for example to `2000`) if it bothers you. |
+| **Interval buttons don't respond** | Check the console for `Photos: tap at X Y`. No line means the tap didn't register: taps are ignored while a photo is being fetched (1–3 s), and a finger that slides more than 15 px counts as a swipe. A line with coordinates outside the buttons means the touch position doesn't match the drawing; send me the line. |
+| **`M5IOE1 not found at I2C address 0x6F` at startup** | The StackChan body wasn't found. The app now retries `BODY_INIT_TRIES` times and then keeps running without the body (no LEDs, servos or battery data), printing "Continuing WITHOUT the StackChan body". If that keeps happening, check that the core is seated firmly on the body and that the body has power, then raise `BODY_INIT_WAIT_MS`. |
+| **Photos UI freezes for a second or two at each change** | That's the API call and image download, which block the loop. It only happens while Photos is visible. |
 
 ## Known limitations and ideas
 
-- Actions like the nod, sound, photo, and weather fetch **block** the loop, so swipes and taps are ignored while they run. A good next step is a small non-blocking task scheduler with `ticks_ms`-based state machines.
+- Actions like the nod, sound, photo, weather fetch, and Unsplash download **block** the loop, so swipes and taps are ignored while they run. A good next step is a small non-blocking task scheduler with `ticks_ms`-based state machines.
 - The weather only updates while the clock app is visible.
 - The mic and speaker can't run together, so the Audio app can't play sounds.
+- LVGL on this firmware has no image cache (`lv.image_cache_resize` doesn't exist), so LVGL image widgets decode on every redraw and are only practical for small icons. Large images should be drawn with M5GFX, as Photos does.
+- Photo Frame mixes M5GFX drawing with LVGL on its page, which M5Stack advises against. It works by keeping LVGL from drawing anything visible there.
+- Photo Frame ideas: tap the photo to skip to the next one, remember the chosen interval across restarts, or dim the screen at night using the clock app's time.
 - The battery percentage is estimated from voltage and isn't a fuel gauge.
 - Future app ideas: battery and servo power monitor, NFC mood cards, IR remote, face tracking, and a "talk to my MCP server" screen.

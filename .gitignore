@@ -1,13 +1,20 @@
-# Python
-__pycache__/
-*.pyc
+# --- Local copies with your real KEYS (never commit these) ---
+# Keep a filled-in copy next to the repo file, e.g. stock-watchlist.local.py
+*.local.py
+*-local.py
+secrets*.py
+.env
+.env.*
 
-# OS / editor clutter
-.DS_Store
-Thumbs.db
+# --- Python / MicroPython build artifacts ---
+__pycache__/
+*.py[cod]
+*.mpy
+
+# --- Editors / OS ---
 .vscode/
 .idea/
-
-# Local-only experiments and exports
-*.bak
-scratch/
+*.swp
+*~
+.DS_Store
+Thumbs.db
