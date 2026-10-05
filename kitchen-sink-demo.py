@@ -12,6 +12,7 @@
 #   App 3: Battery       - voltage, current, power, charge estimate, power graph
 #   App 4: Audio         - microphone level meter / color spectrum
 #   App 5: Photo Frame   - random Unsplash photos every 30 s / 1 min / 5 min
+#   App 6: Flights       - planes near you (adsb.lol), radar, head points at the plane
 #
 # To add a new app: write a class that extends App (see TEMPLATE at the bottom
 # of the "APPS" section) and add it to the APPS list near the end of the file.
@@ -99,6 +100,35 @@ PHOTO_DEFAULT_INTERVAL = 1          # index into PHOTO_INTERVALS (1 = "1 min")
 PHOTO_RETRY_MS = 60 * 1000          # retry delay after an error
 PHOTO_RATE_LIMIT_RETRY_MS = 10 * 60 * 1000
 PHOTO_REPUSH_MS = 5000              # re-copy the photo to the screen this often
+
+# --- Flight tracker (adsb.lol: free, no API key) ---
+FLIGHT_LAT = LATITUDE               # where you are; defaults to the weather location
+FLIGHT_LON = LONGITUDE
+FLIGHT_HOME_ELEV_FT = 30            # your ground elevation, for the "degrees up" angle
+FLIGHT_RANGES_NM = (5, 10, 25)      # the Range button cycles through these (API max 250)
+FLIGHT_DEFAULT_RANGE = 1            # index into FLIGHT_RANGES_NM (1 = 10 nm)
+FLIGHT_REFRESH_MS = 15 * 1000       # how often to ask adsb.lol (only while visible)
+FLIGHT_RETRY_MS = 30 * 1000         # wait after an error
+FLIGHT_RATE_LIMIT_RETRY_MS = 2 * 60 * 1000   # wait after HTTP 429
+FLIGHT_SHOW_GROUND = False          # True = include taxiing / parked aircraft
+FLIGHT_MAX_AGE_S = 60               # ignore positions older than this
+FLIGHT_UI_UPDATE_MS = 1000          # positions are dead-reckoned and redrawn this often
+FLIGHT_NEW_PLANE_LED = 0x0030FF     # LED blink when a new plane enters range (0 = off)
+FLIGHT_EMERGENCY_LED = 0xFF0000     # LED blink when a plane squawks 7500/7600/7700
+FLIGHT_LED_BLINK_MS = 400
+FLIGHT_HTTP_CLIENT = "socket"       # "socket" (own HTTP/1.1 client) or "requests"
+HTTP_TIMEOUT_S = 10
+
+# Head tracking: StackChan turns its head toward the plane on the big card
+HEAD_TRACK_DEFAULT = True           # Head: On at startup
+FACING_DEG = 0                      # compass direction the SCREEN faces at pan 0
+                                    # (0 = north, 90 = east, 180 = south, 270 = west)
+HEAD_PAN_SIGN = 1                   # set to -1 if the head turns the wrong way
+HEAD_PAN_LIMIT = 120                # pan degrees used for tracking (servo max is 135)
+HEAD_TILT_SCALE = 1.0               # tilt servo degrees per degree of elevation
+HEAD_TILT_MAX = 75                  # highest tilt used for tracking (must be <= Y_MAX)
+HEAD_MIN_MOVE_DEG = 3               # ignore smaller changes (less servo chatter)
+HEAD_MOVE_MS = 800                  # servo move time
 
 # --- StackChan body ---
 # At power-up (Run Always / Download) the body can be slow to appear on I2C.
@@ -305,6 +335,76 @@ def chart_set_all(ch, ser, values):
             _chart_by_id = False
     for v in values:                 # fallback: shifting in N values replaces all N
         ch.set_next_value(ser, v)
+
+
+# --- Tappable boxes (text/colors can change later, unlike M5Button) ---
+def fixed_label(parent, text, x, y, w, color, font, align=None):
+    """Label with a fixed width, optionally right- or center-aligned."""
+    lbl = label(parent, text, x, y, color, font)
+    try:
+        lbl.set_width(w)
+        if align is not None:
+            lbl.set_style_text_align(align, 0)
+    except Exception as e:
+        print("fixed_label:", e)
+    return lbl
+
+
+def set_color(lbl, color):
+    lbl.set_style_text_color(lv.color_hex(color), 0)
+
+
+def clickable_box(parent, x, y, w, h, color, radius=6):
+    """A plain clickable rectangle; swipes that start on it reach the page."""
+    o = lv.obj(parent)
+    o.set_pos(x, y)
+    o.set_size(w, h)
+    o.set_style_radius(radius, 0)
+    o.set_style_bg_color(lv.color_hex(color), 0)
+    o.set_style_bg_opa(255, 0)
+    o.set_style_border_width(0, 0)
+    o.set_style_pad_all(0, 0)
+    o.set_style_shadow_width(0, 0)
+    flag_off(o, lv.obj.FLAG.SCROLLABLE)
+    flag_on(o, lv.obj.FLAG.CLICKABLE)
+    flag_on(o, lv.obj.FLAG.GESTURE_BUBBLE)
+    try:
+        o.set_style_bg_opa(150, lv.PART.MAIN | lv.STATE.PRESSED)   # press feedback
+    except Exception:
+        pass
+    return o
+
+
+def on_event(obj, event, fn):
+    def handler(e):
+        if event_code(e) == event:
+            fn()
+    obj.add_event_cb(handler, lv.EVENT.ALL, None)
+
+
+class TapBox:
+    """A button made from a plain lv.obj plus a centered label, so its text
+    and color can be changed at any time. Fires on SHORT_CLICKED by default,
+    so a swipe that starts on it doesn't trigger it."""
+
+    def __init__(self, parent, x, y, w, h, color, text, font, on_tap, event=None):
+        self.obj = clickable_box(parent, x, y, w, h, color)
+        self.lbl = label(self.obj, text, 0, 0, 0xFFFFFF, font)
+        self.lbl.center()
+        self.text = text
+        self.color = color
+        on_event(self.obj, lv.EVENT.SHORT_CLICKED if event is None else event, on_tap)
+
+    def set_text(self, text):
+        if text != self.text:
+            self.text = text
+            self.lbl.set_text(text)
+            self.lbl.center()
+
+    def set_bg(self, color):
+        if color != self.color:
+            self.color = color
+            self.obj.set_style_bg_color(lv.color_hex(color), 0)
 
 
 # =============================================================================
@@ -1615,6 +1715,677 @@ def remove_old_photo_files():
 
 
 # =============================================================================
+# APP 6: FLIGHT TRACKER (planes overhead, from adsb.lol)
+# =============================================================================
+# adsb.lol is a free, community-run ADS-B network (no API key):
+#   GET https://api.adsb.lol/v2/point/{lat}/{lon}/{radius_nm}
+#   -> {"ac":[{hex, flight, r, t, alt_baro, alt_geom, gs, track, baro_rate,
+#              squawk, emergency, category, lat, lon, seen_pos, dst, dir}, ...],
+#       "msg":"No error", "now":..., "total":N}
+# Empty area: {"ac":[], "total":0}. Bad coordinates: HTTP 400, empty body.
+#
+# Between fetches, each plane is moved forward along its track at its ground
+# speed ("dead reckoning"), so the list, radar and head keep moving smoothly.
+
+class FlightError(Exception):
+    pass
+
+
+# --- Own HTTP/1.1 client (same approach as the MBTA and Stock Watchlist apps) ---
+def split_url(url):
+    """'https://host:443/path?q' -> (tls, host, port, path)"""
+    scheme, rest = url.split("://", 1)
+    i = rest.find("/")
+    hostport, path = (rest, "/") if i < 0 else (rest[:i], rest[i:])
+    j = hostport.find(":")
+    if j >= 0:
+        host, port = hostport[:j], int(hostport[j + 1:])
+    else:
+        host, port = hostport, 443 if scheme == "https" else 80
+    return scheme == "https", host, port, path
+
+
+def tls_wrap(sock, host):
+    """Wrap a socket in TLS (no certificate check: the device has no CA store)."""
+    import ssl
+    ctx_cls = getattr(ssl, "SSLContext", None)
+    if ctx_cls is not None:
+        ctx = ctx_cls(ssl.PROTOCOL_TLS_CLIENT)
+        try:
+            ctx.verify_mode = ssl.CERT_NONE
+        except Exception:
+            pass
+        return ctx.wrap_socket(sock, server_hostname=host)
+    return ssl.wrap_socket(sock, server_hostname=host)
+
+
+def read_exact(s, n):
+    """read(n) on a TLS socket may return fewer bytes; keep reading until n."""
+    chunks, got = [], 0
+    while got < n:
+        b = s.read(n - got)
+        if not b:
+            break
+        chunks.append(b)
+        got += len(b)
+    return b"".join(chunks)
+
+
+def read_chunked(s):
+    out = []
+    while True:
+        line = s.readline()
+        if not line:
+            break
+        size = int(line.decode().split(";")[0].strip() or "0", 16)
+        if size == 0:
+            break
+        out.append(read_exact(s, size))
+        s.readline()                         # CRLF after each chunk
+    return b"".join(out)
+
+
+def read_http_response(s):
+    """Returns (status, body bytes)."""
+    status_line = s.readline()
+    if not status_line or not status_line.startswith(b"HTTP/"):
+        raise OSError("bad HTTP reply: %r" % (status_line or b"")[:60])
+    status = int(status_line.split(b" ")[1])
+    hdrs = {}
+    while True:
+        line = s.readline()
+        if not line or line in (b"\r\n", b"\n"):
+            break
+        line = line.decode().strip()
+        i = line.find(":")
+        if i > 0:
+            hdrs[line[:i].strip().lower()] = line[i + 1:].strip()
+    if "content-length" in hdrs:
+        n = int(hdrs["content-length"])
+        body = read_exact(s, n) if n > 0 else b""
+    elif "chunked" in hdrs.get("transfer-encoding", "").lower():
+        body = read_chunked(s)
+    else:
+        body = s.read()                      # until the server closes
+    return status, body or b""
+
+
+def http11_get(url, headers):
+    """GET over HTTP/1.1 with Connection: close. Returns (status, body bytes)."""
+    if FLIGHT_HTTP_CLIENT != "socket":
+        return http_get(url, headers)        # firmware library (Photo Frame's helper)
+    import socket
+    tls, host, port, path = split_url(url)
+    ai = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)[0]
+    sock = socket.socket(ai[0], socket.SOCK_STREAM)
+    s = sock
+    try:
+        sock.settimeout(HTTP_TIMEOUT_S)
+        sock.connect(ai[-1])
+        if tls:
+            s = tls_wrap(sock, host)
+        lines = ["GET %s HTTP/1.1" % path,
+                 "Host: %s" % (host if port in (80, 443) else "%s:%d" % (host, port))]
+        for k, v in headers.items():
+            lines.append("%s: %s" % (k, v))
+        lines.append("Connection: close")
+        s.write(("\r\n".join(lines) + "\r\n\r\n").encode())
+        return read_http_response(s)
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+        if s is not sock:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+
+# --- Flight helpers ---
+NM_FT = 6076.1                          # feet per nautical mile
+COMPASS16 = ("N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
+             "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW")
+EMERGENCY_SQUAWKS = ("7500", "7600", "7700")
+CLIMB_FPM = 250                         # |vertical rate| above this shows an arrow
+
+FT_CARD = 0x14202E
+FT_ROW = 0x1A2636
+FT_ACCENT = 0x0DC9F4
+FT_SOFT = 0x9FB3C8
+FT_WARN = 0xFF8A80
+FT_EMERG = 0xFF3D3D
+FT_DOT = 0x4FC3F7
+FT_HERO_DOT = 0xFFD54F
+FT_BTN_ON = 0x1E88E5
+FT_BTN_OFF = 0x263040
+
+
+def compass(deg):
+    return COMPASS16[int((deg % 360) / 22.5 + 0.5) % 16]
+
+
+def commas(n):
+    s = "%d" % abs(n)
+    out = ""
+    while len(s) > 3:
+        out = "," + s[-3:] + out
+        s = s[:-3]
+    return ("-" if n < 0 else "") + s + out
+
+
+def alt_short(alt):
+    if alt is None:
+        return "GND"
+    if alt < 1000:
+        return "%d" % alt
+    return "%.1fk" % (alt / 1000)
+
+
+def dist_short(d):
+    return ("%.1fnm" % d) if d < 10 else ("%dnm" % int(d + 0.5))
+
+
+def num(v):
+    """JSON number -> float, anything else (None, "ground") -> None."""
+    return float(v) if isinstance(v, (int, float)) else None
+
+
+def parse_aircraft(ac, cos_lat):
+    """One adsb.lol aircraft record -> small dict, or None to skip it."""
+    lat, lon = num(ac.get("lat")), num(ac.get("lon"))
+    if lat is None or lon is None:
+        return None                     # no position
+    if (ac.get("category") or "").startswith("C"):
+        return None                     # C1/C2/C3 = ground vehicles, obstacles
+    ground = ac.get("alt_baro") == "ground"
+    if ground and not FLIGHT_SHOW_GROUND:
+        return None
+    age = num(ac.get("seen_pos"))
+    if age is None:
+        age = num(ac.get("seen")) or 0.0
+    if age > FLIGHT_MAX_AGE_S:
+        return None
+    alt = None
+    if not ground:
+        alt = num(ac.get("alt_geom"))
+        if alt is None:
+            alt = num(ac.get("alt_baro"))
+        if alt is None:
+            return None
+    hexid = ac.get("hex") or "?"
+    reg = ac.get("r") or ""
+    call = (ac.get("flight") or "").strip()
+    if not call or not call.strip("0"):  # "", "00000000"
+        call = reg or hexid.upper()
+    rate = num(ac.get("baro_rate"))
+    if rate is None:
+        rate = num(ac.get("geom_rate"))
+    squawk = ac.get("squawk") or ""
+    emerg = ac.get("emergency") or "none"
+    return {
+        "hex": hexid,
+        "call": call[:8],
+        "type": ac.get("t") or "?",
+        "reg": reg,
+        "alt": alt,                       # feet, None = on the ground
+        "gs": num(ac.get("gs")),          # knots
+        "trk": num(ac.get("track")),      # degrees true
+        "rate": rate or 0.0,              # feet per minute
+        "squawk": squawk,
+        "emerg": squawk in EMERGENCY_SQUAWKS or emerg != "none",
+        "age": age,                       # seconds old at reply time
+        # position in nautical miles east (x) / north (y) of you
+        "x": (lon - FLIGHT_LON) * 60.0 * cos_lat,
+        "y": (lat - FLIGHT_LAT) * 60.0,
+    }
+
+
+class FlightTrackerApp(App):
+    """Planes near you from adsb.lol. The big card shows the nearest plane
+    (or the one you tapped); StackChan turns its head toward it. Below it,
+    the next 4 nearest. On the right: a north-up radar, a head-tracking
+    toggle, and a range button."""
+
+    NAME = "Flights"
+    BG = 0x0A0F16
+
+    ROWS = 4
+    ROW_Y = 118
+    ROW_H = 24
+    ROW_GAP = 2
+    RADAR_CX = 263
+    RADAR_CY = 76
+    RADAR_D = 100
+    MAX_DOTS = 30
+
+    def build(self, page):
+        # --- top bar ---
+        label(page, "Flights", 6, 4, FT_ACCENT, lv.font_montserrat_18)
+        self.status = fixed_label(page, "", 90, 8, 120, FT_SOFT, lv.font_montserrat_12,
+                                  lv.TEXT_ALIGN.RIGHT)
+        self.status_color = FT_SOFT
+
+        # --- big card: nearest / tracked plane ---
+        self.hero = clickable_box(page, 4, 28, 204, 86, FT_CARD, 8)
+        on_event(self.hero, lv.EVENT.SHORT_CLICKED, self.tap_hero)
+        self.h_call = label(self.hero, "--", 8, 4, 0xFFFFFF, lv.font_montserrat_24)
+        self.h_tag = fixed_label(self.hero, "", 110, 10, 88, FT_SOFT, lv.font_montserrat_12,
+                                 lv.TEXT_ALIGN.RIGHT)
+        self.h_l2 = label(self.hero, "", 8, 34, FT_SOFT, lv.font_montserrat_14)
+        self.h_l3 = label(self.hero, "", 8, 51, 0xFFFFFF, lv.font_montserrat_14)
+        self.h_l4 = label(self.hero, "", 8, 68, FT_SOFT, lv.font_montserrat_12)
+        self.h_tag_color = FT_SOFT
+
+        # --- list of the next nearest planes ---
+        self.rows = []
+        self.row_hex = [None] * self.ROWS
+        for i in range(self.ROWS):
+            y = self.ROW_Y + i * (self.ROW_H + self.ROW_GAP)
+            box = clickable_box(page, 4, y, 204, self.ROW_H, FT_ROW, 6)
+            on_event(box, lv.EVENT.SHORT_CLICKED, lambda i=i: self.tap_row(i))
+            r = {
+                "box": box,
+                "call": label(box, "", 6, 3, 0xFFFFFF, lv.font_montserrat_14),
+                "type": label(box, "", 82, 5, FT_SOFT, lv.font_montserrat_12),
+                "alt": fixed_label(box, "", 112, 5, 44, FT_SOFT, lv.font_montserrat_12,
+                                   lv.TEXT_ALIGN.RIGHT),
+                "dist": fixed_label(box, "", 156, 5, 44, 0xFFFFFF, lv.font_montserrat_12,
+                                    lv.TEXT_ALIGN.RIGHT),
+                "color": 0xFFFFFF,
+            }
+            show(box, False)
+            self.rows.append(r)
+        self.msg = fixed_label(page, "Looking for planes...", 4, 150, 204, FT_SOFT,
+                               lv.font_montserrat_14, lv.TEXT_ALIGN.CENTER)
+
+        # --- radar (north up) ---
+        cx, cy, d = self.RADAR_CX, self.RADAR_CY, self.RADAR_D
+        ring = shape(page, cx - d // 2, cy - d // 2, d, d, 0x07130D, CIRCLE)
+        ring.set_style_border_width(1, 0)
+        ring.set_style_border_color(lv.color_hex(0x1F4D33), 0)
+        inner = shape(page, cx - d // 4, cy - d // 4, d // 2, d // 2, 0x07130D, CIRCLE, 0)
+        inner.set_style_border_width(1, 0)
+        inner.set_style_border_color(lv.color_hex(0x16301F), 0)
+        shape(page, cx, cy - d // 2 + 2, 1, d - 4, 0x16301F)
+        shape(page, cx - d // 2 + 2, cy, d - 4, 1, 0x16301F)
+        label(page, "N", cx - 4, cy - d // 2 + 1, 0x4CAF50, lv.font_montserrat_12)
+        circle(page, cx, cy, 5, 0xFFFFFF)                      # you
+        self.dots = []
+        for _ in range(self.MAX_DOTS):
+            dot = circle(page, cx, cy, 6, FT_DOT)
+            show(dot, False)
+            self.dots.append([dot, None, None])                # obj, pos, color
+        self.hdot = circle(page, cx, cy, 10, FT_HERO_DOT)      # created last = on top
+        show(self.hdot, False)
+        self.hdot_color = FT_HERO_DOT
+
+        # --- buttons ---
+        self.track = HEAD_TRACK_DEFAULT
+        self.track_btn = TapBox(page, 212, 134, 104, 30, FT_BTN_OFF, "Head", lv.font_montserrat_14,
+                                self.tap_track)
+        self.range_i = FLIGHT_DEFAULT_RANGE % len(FLIGHT_RANGES_NM)
+        self.range_btn = TapBox(page, 212, 170, 104, 30, FT_BTN_OFF, "", lv.font_montserrat_14,
+                                self.tap_range)
+
+        # --- state ---
+        self.planes = []
+        self.fetch_ticks = None         # ticks_ms of the last good reply
+        self.err = None
+        self.known = None               # hexes seen in the last fetch (for the LED blink)
+        self.sel_hex = None             # tapped plane; None = follow the nearest
+        self.head = None                # last (pan, tilt) sent to the servos
+        self.led_until = None
+        self.req = None                 # request from a tap, handled in tick()
+        self.next_fetch = time.ticks_ms()
+        self.last_ui = time.ticks_ms()
+        self.update_buttons()
+
+    # --- taps (only record a request; tick() does the work) ------------
+    def tap_hero(self):
+        self.req = ("auto", None)
+
+    def tap_row(self, i):
+        self.req = ("select", self.row_hex[i])
+
+    def tap_track(self):
+        self.req = ("track", None)
+
+    def tap_range(self):
+        self.req = ("range", None)
+
+    # --- lifecycle -------------------------------------------------------
+    def on_enter(self):
+        now = time.ticks_ms()
+        stale = (self.fetch_ticks is None or
+                 time.ticks_diff(now, self.fetch_ticks) >= FLIGHT_REFRESH_MS)
+        if stale:
+            # let the swipe animation finish before blocking on the network
+            self.next_fetch = time.ticks_add(now, 600)
+        self.head = None
+        self.last_ui = time.ticks_add(now, -FLIGHT_UI_UPDATE_MS)
+
+    def on_exit(self):
+        self.head_home()
+        if self.led_until is not None:
+            self.sc.set_rgb_color(0x000000)
+            self.led_until = None
+
+    def tick(self):
+        if self.req:
+            kind, arg = self.req
+            self.req = None
+            self.handle(kind, arg)
+        now = time.ticks_ms()
+        if self.led_until is not None and time.ticks_diff(now, self.led_until) >= 0:
+            self.sc.set_rgb_color(0x000000)
+            self.led_until = None
+        if time.ticks_diff(now, self.next_fetch) >= 0:
+            self.fetch()
+            self.last_ui = time.ticks_add(time.ticks_ms(), -FLIGHT_UI_UPDATE_MS)
+        if time.ticks_diff(time.ticks_ms(), self.last_ui) >= FLIGHT_UI_UPDATE_MS:
+            self.update_view()
+
+    def handle(self, kind, arg):
+        if kind == "auto":
+            self.sel_hex = None
+        elif kind == "select" and arg:
+            self.sel_hex = arg
+        elif kind == "track":
+            self.track = not self.track
+            if not self.track:
+                self.head_home()
+        elif kind == "range":
+            self.range_i = (self.range_i + 1) % len(FLIGHT_RANGES_NM)
+            self.known = None           # don't blink for planes that were just out of range
+            self.next_fetch = time.ticks_ms()
+        self.update_buttons()
+        self.last_ui = time.ticks_add(time.ticks_ms(), -FLIGHT_UI_UPDATE_MS)
+
+    def update_buttons(self):
+        if not self.mgr.has_body:
+            self.track_btn.set_text("Head: n/a")
+            self.track_btn.set_bg(FT_BTN_OFF)
+        else:
+            self.track_btn.set_text("Head: " + ("On" if self.track else "Off"))
+            self.track_btn.set_bg(FT_BTN_ON if self.track else FT_BTN_OFF)
+        self.range_btn.set_text("%d nm" % FLIGHT_RANGES_NM[self.range_i])
+
+    # --- network ---------------------------------------------------------
+    def fetch(self):
+        if not wifi_connected():
+            self.err = "No Wi-Fi"
+            self.next_fetch = time.ticks_add(time.ticks_ms(), FLIGHT_RETRY_MS)
+            return
+        self.set_status(lv.SYMBOL.REFRESH + " Updating", FT_SOFT)
+        refresh_now()
+        rng = FLIGHT_RANGES_NM[self.range_i]
+        url = "https://api.adsb.lol/v2/point/%.4f/%.4f/%d" % (FLIGHT_LAT, FLIGHT_LON, rng)
+        wait = FLIGHT_RETRY_MS
+        try:
+            t0 = time.ticks_ms()
+            status, body = http11_get(url, {"Accept": "application/json",
+                                            "User-Agent": "StackChan-KitchenSink"})
+            if status == 429:
+                wait = FLIGHT_RATE_LIMIT_RETRY_MS
+                raise FlightError("Rate limited, waiting")
+            if status == 400:
+                raise FlightError("Bad location in CONFIG")
+            if status != 200:
+                raise FlightError("HTTP %d" % status)
+            try:
+                data = json.loads(body.decode("utf-8"))
+            except Exception:
+                raise FlightError("Bad reply")
+            body = None
+            ac = data.get("ac") if isinstance(data, dict) else None
+            if ac is None:
+                raise FlightError("Bad reply")
+            n_all = len(ac)
+            cos_lat = math.cos(math.radians(FLIGHT_LAT))
+            planes = []
+            for a in ac:
+                p = parse_aircraft(a, cos_lat)
+                if p:
+                    planes.append(p)
+            data = ac = None
+            gc.collect()
+            planes.sort(key=lambda p: p["x"] * p["x"] + p["y"] * p["y"])
+            print("Flights: %d of %d aircraft shown, %d nm (%d ms)"
+                  % (len(planes), n_all, rng, time.ticks_diff(time.ticks_ms(), t0)))
+            self.got_planes(planes)
+            self.err = None
+            wait = FLIGHT_REFRESH_MS
+        except FlightError as e:
+            print("Flights:", e)
+            self.err = str(e)
+        except Exception as e:
+            print("Flights fetch failed:")
+            try:
+                sys.print_exception(e)
+            except Exception:
+                print(repr(e))
+            self.err = "Network error"
+        self.next_fetch = time.ticks_add(time.ticks_ms(), wait)
+
+    def got_planes(self, planes):
+        hexes = set(p["hex"] for p in planes)
+        emergency = any(p["emerg"] for p in planes)
+        new = self.known is not None and any(h not in self.known for h in hexes)
+        color = FLIGHT_EMERGENCY_LED if emergency else FLIGHT_NEW_PLANE_LED if new else 0
+        if color:
+            self.sc.set_rgb_color(color)
+            self.led_until = time.ticks_add(time.ticks_ms(), FLIGHT_LED_BLINK_MS)
+        self.known = hexes
+        self.planes = planes
+        self.fetch_ticks = time.ticks_ms()
+
+    # --- dead reckoning ----------------------------------------------------
+    def place(self, p, now):
+        """Move the plane forward from its last reported position. Sets
+        cdst (nm), cdir (bearing from you), calt (ft) and elev (degrees up)."""
+        dt = p["age"] + time.ticks_diff(now, self.fetch_ticks) / 1000.0
+        dt = min(dt, 90.0)
+        x, y, alt = p["x"], p["y"], p["alt"]
+        gs, trk = p["gs"], p["trk"]
+        if gs and trk is not None:
+            d = gs * dt / 3600.0
+            r = math.radians(trk)
+            x += d * math.sin(r)
+            y += d * math.cos(r)
+        if alt is not None and p["rate"]:
+            alt = max(0.0, alt + p["rate"] * dt / 60.0)
+        dst = math.sqrt(x * x + y * y)
+        p["cx"], p["cy"], p["calt"], p["cdst"] = x, y, alt, dst
+        p["cdir"] = math.degrees(math.atan2(x, y)) % 360
+        if alt is None:
+            p["elev"] = 0.0
+        else:
+            p["elev"] = max(0.0, math.degrees(
+                math.atan2(alt - FLIGHT_HOME_ELEV_FT, max(dst, 0.01) * NM_FT)))
+
+    # --- drawing -----------------------------------------------------------
+    def set_status(self, text, color):
+        self.status.set_text(text)
+        if color != self.status_color:
+            self.status_color = color
+            set_color(self.status, color)
+
+    def pick_hero(self):
+        if not self.planes:
+            return None
+        if self.sel_hex:
+            for p in self.planes:
+                if p["hex"] == self.sel_hex:
+                    return p
+            self.sel_hex = None         # it left the area: back to nearest
+        best = self.planes[0]
+        for p in self.planes:
+            if p["cdst"] < best["cdst"]:
+                best = p
+        return best
+
+    def update_view(self):
+        now = time.ticks_ms()
+        self.last_ui = now
+        if self.fetch_ticks is not None:
+            for p in self.planes:
+                self.place(p, now)
+        hero = self.pick_hero() if self.fetch_ticks is not None else None
+        self.draw_hero(hero)
+        self.draw_rows(hero)
+        self.draw_radar(hero)
+        self.draw_status(now)
+        self.aim_head(hero)
+
+    def draw_status(self, now):
+        if self.err:
+            self.set_status(self.err, FT_WARN)
+        elif self.fetch_ticks is None:
+            self.set_status("", FT_SOFT)
+        else:
+            age = time.ticks_diff(now, self.fetch_ticks) // 1000
+            n = len(self.planes)
+            self.set_status("%d plane%s • %ds ago" % (n, "" if n == 1 else "s", age), FT_SOFT)
+
+    def draw_hero(self, p):
+        if p is None:
+            self.h_call.set_text("--")
+            self.h_l2.set_text("")
+            self.h_l3.set_text("")
+            self.h_l4.set_text("")
+            self.set_tag("", FT_SOFT)
+            return
+        self.h_call.set_text(p["call"])
+        l2 = p["type"]
+        if p["reg"] and p["reg"] != p["call"]:
+            l2 += " • " + p["reg"]
+        self.h_l2.set_text(l2)
+        gs = ("%d kt" % int(p["gs"] + 0.5)) if p["gs"] is not None else "-- kt"
+        if p["calt"] is None:
+            self.h_l3.set_text("On ground   " + gs)
+        else:
+            arrow = ""
+            if p["rate"] > CLIMB_FPM:
+                arrow = " " + lv.SYMBOL.UP
+            elif p["rate"] < -CLIMB_FPM:
+                arrow = " " + lv.SYMBOL.DOWN
+            alt = int(p["calt"] / 25 + 0.5) * 25       # don't flicker the last digits
+            self.h_l3.set_text("%s ft%s   %s" % (commas(alt), arrow, gs))
+        self.h_l4.set_text("%.1f nm %s  •  %d° up"
+                           % (p["cdst"], compass(p["cdir"]), int(p["elev"] + 0.5)))
+        if p["emerg"]:
+            self.set_tag("SQUAWK " + (p["squawk"] or "EMERG"), FT_EMERG)
+        elif self.sel_hex:
+            self.set_tag("TRACKING", FT_HERO_DOT)
+        else:
+            self.set_tag("NEAREST", FT_SOFT)
+
+    def set_tag(self, text, color):
+        self.h_tag.set_text(text)
+        if color != self.h_tag_color:
+            self.h_tag_color = color
+            set_color(self.h_tag, color)
+
+    def draw_rows(self, hero):
+        others = [p for p in self.planes if p is not hero] if self.fetch_ticks is not None else []
+        for i, r in enumerate(self.rows):
+            if i < len(others):
+                p = others[i]
+                self.row_hex[i] = p["hex"]
+                r["call"].set_text(p["call"])
+                r["type"].set_text(p["type"][:4])
+                r["alt"].set_text(alt_short(p["calt"]))
+                r["dist"].set_text(dist_short(p["cdst"]))
+                color = FT_EMERG if p["emerg"] else 0xFFFFFF
+                if color != r["color"]:
+                    r["color"] = color
+                    set_color(r["call"], color)
+                show(r["box"], True)
+            else:
+                self.row_hex[i] = None
+                show(r["box"], False)
+        # message in the list area
+        if self.fetch_ticks is None:
+            text = self.err or "Looking for planes..."
+        elif not self.planes:
+            text = "No planes within %d nm" % FLIGHT_RANGES_NM[self.range_i]
+        else:
+            text = ""
+        self.msg.set_text(text)
+        show(self.msg, bool(text))
+
+    def radar_xy(self, p, size):
+        rng = float(FLIGHT_RANGES_NM[self.range_i])
+        r = self.RADAR_D / 2 - 4
+        dx, dy = p["cx"] / rng * r, p["cy"] / rng * r
+        m = math.sqrt(dx * dx + dy * dy)
+        if m > r:                       # outside the ring: pin it to the edge
+            dx, dy = dx * r / m, dy * r / m
+        return (int(self.RADAR_CX + dx) - size // 2, int(self.RADAR_CY - dy) - size // 2)
+
+    def draw_radar(self, hero):
+        planes = self.planes if self.fetch_ticks is not None else []
+        others = [p for p in planes if p is not hero]
+        for i, slot in enumerate(self.dots):
+            dot = slot[0]
+            if i < len(others):
+                p = others[i]
+                pos = self.radar_xy(p, 6)
+                if pos != slot[1]:
+                    slot[1] = pos
+                    dot.set_pos(*pos)
+                color = FT_EMERG if p["emerg"] else FT_DOT
+                if color != slot[2]:
+                    slot[2] = color
+                    dot.set_style_bg_color(lv.color_hex(color), 0)
+                show(dot, True)
+            else:
+                show(dot, False)
+        if hero is None:
+            show(self.hdot, False)
+        else:
+            self.hdot.set_pos(*self.radar_xy(hero, 10))
+            color = FT_EMERG if hero["emerg"] else FT_HERO_DOT
+            if color != self.hdot_color:
+                self.hdot_color = color
+                self.hdot.set_style_bg_color(lv.color_hex(color), 0)
+            show(self.hdot, True)
+
+    # --- head tracking -------------------------------------------------------
+    def aim_head(self, p):
+        if not self.track or not self.mgr.has_body:
+            return
+        if p is None:
+            self.head_home()
+            return
+        rel = (p["cdir"] - FACING_DEG + 540) % 360 - 180    # -180..180, + = clockwise
+        pan = int(clamp(rel, -HEAD_PAN_LIMIT, HEAD_PAN_LIMIT) * HEAD_PAN_SIGN)
+        tilt = int(clamp_y(min(HEAD_TILT_MAX, HOME_Y + p["elev"] * HEAD_TILT_SCALE)))
+        self.move_head(pan, tilt)
+
+    def head_home(self):
+        if self.head is not None and self.head != (HOME_X, clamp_y(HOME_Y)):
+            self.move_head(HOME_X, clamp_y(HOME_Y), force=True)
+        self.head = None
+
+    def move_head(self, pan, tilt, force=False):
+        if not self.mgr.has_body:
+            return
+        if (not force and self.head is not None
+                and abs(pan - self.head[0]) < HEAD_MIN_MOVE_DEG
+                and abs(tilt - self.head[1]) < HEAD_MIN_MOVE_DEG):
+            return
+        try:
+            self.sc.set_servo_angle(self.sc.SERVO_ID_X, pan, HEAD_MOVE_MS, 0)
+            self.sc.set_servo_angle(self.sc.SERVO_ID_Y, tilt, HEAD_MOVE_MS, 0)
+            self.head = (pan, tilt)
+        except Exception as e:
+            print("Head move failed:", e)
+
+
+# =============================================================================
 # TEMPLATE for your next app (copy, rename, add to APPS)
 # =============================================================================
 # class MyApp(App):
@@ -1774,6 +2545,7 @@ APPS = [
     BatteryApp,
     AudioApp,
     PhotoFrameApp,
+    FlightTrackerApp,
     # MyApp,
 ]
 

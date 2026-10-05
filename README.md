@@ -11,6 +11,7 @@ Swipe **left** for the next app and **right** for the previous one. It wraps aro
 | 3 | **Battery** | Charge gauge (estimated from voltage), voltage, current, power, charging status, and a 60-second power graph |
 | 4 | **Audio** | Live microphone visuals with two modes chosen from buttons along the top: **Meter** and **Colors** |
 | 5 | **Photo Frame** | Random photos from [Unsplash](https://unsplash.com), full screen, with the photographer credited. Three buttons choose how often the photo changes: **30 s**, **1 min**, or **5 min** |
+| 6 | **Flights** | Planes near you from [adsb.lol](https://adsb.lol) (free, no key): a big card for the nearest plane, the next 4 in a list, and a radar. StackChan turns its head toward the plane on the card |
 
 ---
 
@@ -27,6 +28,8 @@ Swipe **left** for the next app and **right** for the previous one. It wraps aro
   ![image](images/AudioMeter.jpg)
 * Photo Frame
   ![image](images/PhotoFrame.jpg)
+* Flights
+  ![image](images/FlightTracker.jpg)
 
 ## Tested on
 
@@ -39,12 +42,15 @@ Swipe **left** for the next app and **right** for the previous one. It wraps aro
 Kitchen Sink Demo uses the StackChan-specific `hardware.stackchan` driver. If the body isn't found at startup, the app still runs, but LEDs, servos and battery readings do nothing (see Troubleshooting).
 
 > **Photo Frame's final design (M5GFX canvas) is not yet tested end to end.** The pieces it relies on were measured on the device (see [Photo Frame app](#photo-frame-app)); the first-run checklist there says what to watch for.
+>
+> **Flights is not yet tested on the device.** The adsb.lol replies it parses were captured with curl, and the parsing was checked against them on a PC. See its [first run checklist](#flights-first-run-checklist).
 
 ## Requirements
 
 - StackChan flashed with **UIFlow2.0 for StackChan** (tested against the 2.5.x API)
-- Wi-Fi configured in UIFlow2, which the clock, weather and photo frame need. Controls works offline.
+- Wi-Fi configured in UIFlow2, which the clock, weather, photo frame and flights need. Controls works offline.
 - Weather needs no API key. It comes from [Open-Meteo](https://open-meteo.com/), which is free and needs no signup.
+- Flights needs no API key. It comes from [adsb.lol](https://adsb.lol), a free, community-run ADS-B network.
 - The photo frame needs a free **Unsplash Access Key**. Sign up at [unsplash.com/developers](https://unsplash.com/developers), create an application under **Your apps**, and copy its **Access Key** (not the Secret Key). New apps are in demo mode, which allows 50 API calls per hour; the app stays well under that.
 
 ## Run it
@@ -58,6 +64,7 @@ Kitchen Sink Demo uses the StackChan-specific `hardware.stackchan` driver. If th
    ```
 
    Until you do, the Photos app shows "Set UNSPLASH_ACCESS_KEY in CONFIG" and makes no requests. Keep your real key out of the repo (for example in a `*.local.py` copy, which `.gitignore` excludes).
+   For Flights, set `FACING_DEG` to the compass direction StackChan's screen faces (see [Head tracking](#head-tracking)).
 4. Click **Run Once** to test. Click **Download** to make it the program that runs at boot.
 
 ## Configuration
@@ -96,6 +103,25 @@ All settings are in the `CONFIG` block at the top of the file.
 | `PHOTO_DEFAULT_INTERVAL` | `1` | Which interval is selected at startup (index into `PHOTO_INTERVALS`; 1 = "1 min"). |
 | `PHOTO_RETRY_MS` / `PHOTO_RATE_LIMIT_RETRY_MS` | 60 s / 10 min | Wait after an error, and after hitting the Unsplash rate limit. |
 | `PHOTO_REPUSH_MS` | `5000` | How often the photo is copied to the screen again, in case something drew over it. |
+| `FLIGHT_LAT` / `FLIGHT_LON` | `LATITUDE` / `LONGITUDE` | Where you are. Defaults to the weather location. |
+| `FLIGHT_HOME_ELEV_FT` | `30` | Your ground elevation in feet, used for the "degrees up" angle. |
+| `FLIGHT_RANGES_NM` | `(5, 10, 25)` | Search radii in nautical miles that the **Range** button cycles through (the API allows up to 250). |
+| `FLIGHT_DEFAULT_RANGE` | `1` | Range selected at startup (index into `FLIGHT_RANGES_NM`; 1 = 10 nm). |
+| `FLIGHT_REFRESH_MS` | 15 s | How often adsb.lol is asked, only while Flights is on screen. |
+| `FLIGHT_RETRY_MS` / `FLIGHT_RATE_LIMIT_RETRY_MS` | 30 s / 2 min | Wait after an error, and after HTTP 429. |
+| `FLIGHT_SHOW_GROUND` | `False` | `True` includes taxiing and parked aircraft. Ground vehicles (categories C1–C3) are always hidden. |
+| `FLIGHT_MAX_AGE_S` | `60` | Ignore aircraft whose last position is older than this. |
+| `FLIGHT_UI_UPDATE_MS` | `1000` | How often positions are moved forward and redrawn between fetches. |
+| `FLIGHT_NEW_PLANE_LED` / `FLIGHT_EMERGENCY_LED` | blue / red | LED blink when a new plane enters range, or when one squawks 7500/7600/7700. `0` turns a blink off. |
+| `FLIGHT_LED_BLINK_MS` | `400` | Length of the blink. |
+| `FLIGHT_HTTP_CLIENT` | `"socket"` | `"socket"` = own HTTP/1.1 client; `"requests"` = the firmware library. |
+| `HTTP_TIMEOUT_S` | `10` | Socket timeout for the HTTP/1.1 client. |
+| `HEAD_TRACK_DEFAULT` | `True` | Whether **Head** starts On. |
+| `FACING_DEG` | `0` | Compass direction StackChan's **screen** faces when the head is at pan 0 (0 = north, 90 = east). |
+| `HEAD_PAN_SIGN` | `1` | Set to `-1` if the head turns the wrong way. |
+| `HEAD_PAN_LIMIT` | `120` | Largest pan used for tracking (the servo allows 135). |
+| `HEAD_TILT_SCALE` / `HEAD_TILT_MAX` | `1.0` / `75` | Tilt servo degrees per degree of elevation, and the highest tilt used. Tilt is also kept inside `Y_MIN`..`Y_MAX`. |
+| `HEAD_MIN_MOVE_DEG` / `HEAD_MOVE_MS` | `3` / `800` | Ignore smaller changes (less servo chatter), and servo move time. |
 | `BODY_INIT_TRIES` / `BODY_INIT_WAIT_MS` | `6` / `500` | How many times to look for the StackChan body at startup, and the wait between tries. At power-up the body can be slow to appear. |
 | `SWIPE_ANIM_MS` | `250` | Length of the slide animation between apps. |
 
@@ -110,6 +136,7 @@ AppManager                      owns hardware, pages, swipe navigation, main loo
  ├─ BatteryApp(App)             app 3
  ├─ AudioApp(App)               app 4
  ├─ PhotoFrameApp(App)          app 5
+ ├─ FlightTrackerApp(App)       app 6
  └─ ...your apps(App)           add to the APPS list
 ```
 
@@ -248,6 +275,82 @@ If the limit is hit anyway (for example, several devices sharing one key), Unspl
 - **Swipes:** swiping left or right on the photo should still change apps. After you swipe back to Photos, the photo should reappear about a quarter-second after the slide ends.
 - **Black patches or a blank page:** if these appear over the photo, LVGL drew over it. It should fix itself within `PHOTO_REPUSH_MS`. If it doesn't, check the console.
 
+### Flights app
+
+Flights shows aircraft near you using [adsb.lol](https://adsb.lol), a free, community-run ADS-B network that needs no API key.
+
+| Area | What it shows |
+|---|---|
+| Top bar | Number of planes and how long ago the data was fetched, or an error |
+| Big card | The nearest plane: callsign, aircraft type and registration, altitude with a climb/descent arrow, ground speed, distance and compass direction, and how many degrees above the horizon it is. The tag at top right says **NEAREST**, **TRACKING** (a plane you picked) or **SQUAWK 7700** (emergency, in red) |
+| List | The next 4 nearest planes: callsign, type, altitude (`8.4k`, `GND`), distance |
+| Radar | North-up, with you in the middle. The outer ring is the selected range, the inner ring half of it. The card's plane is the large yellow dot; planes beyond the ring are pinned to its edge |
+| **Head** button | Turns head tracking on or off |
+| **Range** button | Cycles 5 / 10 / 25 nm and fetches again right away |
+
+**Tap a list row** to put that plane on the card and track it. **Tap the card** to go back to following the nearest plane. If the tracked plane leaves the area, the card goes back to the nearest one. Rows, the card and the buttons react on a short click, so a swipe that starts on them still changes apps.
+
+The LEDs blink blue when a new plane enters range, and red when any plane squawks an emergency code.
+
+#### The API
+
+```
+GET https://api.adsb.lol/v2/point/{lat}/{lon}/{radius_nm}
+```
+
+Replies captured with curl:
+
+| Case | Reply |
+|---|---|
+| Normal | `200`, `{"ac":[{...}, ...], "msg":"No error", "now":..., "total":19}` (10 nm over Boston: 19 aircraft, about 8 KB) |
+| Nothing in range | `200`, `{"ac":[], "msg":"No error", "total":0}` |
+| Bad coordinates | `400` with an empty body |
+
+Fields the app reads from each aircraft:
+
+```
+{"hex":"a81abe", "flight":"JBU516  ", "r":"N621JB", "t":"A320",
+ "alt_baro":8350, "alt_geom":8600, "gs":290.4, "track":105.38, "baro_rate":-640,
+ "squawk":"4161", "emergency":"none", "category":"A3",
+ "lat":42.464486, "lon":-71.171605, "seen_pos":0.026}
+```
+
+Things to know about the data:
+
+- `alt_baro` is the string `"ground"` for aircraft on the ground, which then have no `alt_geom`. Ground aircraft are hidden unless `FLIGHT_SHOW_GROUND` is `True`.
+- Airport ground vehicles appear too (for example `BOSSQD1`, category `C1`). Categories starting with `C` are always hidden.
+- `flight` is padded with spaces, and is sometimes `"00000000"`. The app then shows the registration (`r`) or the hex code instead.
+- The reply also has `dst` and `dir` (distance and bearing from the query point). The app computes these itself from `lat`/`lon`, because it needs east/north offsets for the radar and for dead reckoning anyway. The two agree to within 0.01 nm on the captured data.
+
+Each reply is reduced to a small dict per plane right away, and the raw JSON is dropped. The request uses the same HTTP/1.1-over-TLS socket client as the MBTA and Stock Watchlist apps (`http11_get`).
+
+#### Dead reckoning
+
+The app fetches every 15 s, but a jet at 300 kt moves about 1.2 nm in that time. So between fetches, once a second, each plane is moved forward from its last reported position along its `track` at its ground speed (`gs`), and its altitude changes by its vertical rate. The time used includes `seen_pos`, the age of the position when the reply was made. Positions are never extrapolated more than 90 s. This keeps the distances, the radar and the head moving smoothly.
+
+#### Head tracking
+
+The head points at the plane on the card:
+
+- **Pan:** the plane's compass bearing minus `FACING_DEG`, limited to ±`HEAD_PAN_LIMIT`. For a plane behind StackChan, the head turns as far as it can toward that side.
+- **Tilt:** `HOME_Y` plus the plane's elevation angle times `HEAD_TILT_SCALE`, capped at `HEAD_TILT_MAX` and kept inside `Y_MIN`..`Y_MAX`.
+
+The servos only move when the target changes by at least `HEAD_MIN_MOVE_DEG`. The head goes back to `HOME_X` / `HOME_Y` when you turn **Head** off, when no plane is in range, and when you swipe away.
+
+To set it up:
+
+1. Find which way StackChan's **screen** faces with a phone compass (stand behind StackChan and point the phone the way the screen faces). Put that bearing in `FACING_DEG`.
+2. Run the app and pick a plane that is clearly to one side. If the head turns away from it, set `HEAD_PAN_SIGN = -1`.
+3. If a high plane makes the head look too high or too low, adjust `HEAD_TILT_SCALE`.
+
+#### Flights first run checklist
+
+- **Console:** look for `Flights: N of M aircraft shown, 10 nm (NNNN ms)`. The time is the request plus parsing, probably 1–3 s.
+- **Status:** the top bar should count up (`1s ago`, `2s ago`, ...) and reset about every 15 s.
+- **Card and radar:** distances should change a little every second between fetches, and the dots should drift.
+- **Head:** check the pan direction (step 2 above). Tilt never goes outside `Y_MIN`..`Y_MAX`.
+- **Taps:** tapping a row should show **TRACKING** on the card within a second; tapping the card should show **NEAREST**.
+
 ---
 
 ## Adding a new app
@@ -279,7 +382,7 @@ If the limit is hit anyway (for example, several devices sharing one key), Unspl
 
 That's all you need. The page dots, swipe handling, and ordering update automatically.
 
-Some helpers you can reuse: `label(...)`, `shape(...)`, `circle(...)`, `container(...)`, `show(obj, visible)`, `hsv(h, s, v)`, `make_chart(...)` / `chart_range(...)` / `chart_set_all(...)`, `set_page_gradient(...)`, `refresh_now()`, `http_get_json(url)`, `wifi_connected()`, `clamp(...)`, and `clamp_y(angle)`.
+Some helpers you can reuse: `label(...)`, `shape(...)`, `circle(...)`, `container(...)`, `show(obj, visible)`, `hsv(h, s, v)`, `make_chart(...)` / `chart_range(...)` / `chart_set_all(...)`, `set_page_gradient(...)`, `refresh_now()`, `fixed_label(...)`, `set_color(lbl, color)`, `clickable_box(...)`, `on_event(obj, event, fn)`, `TapBox(...)` (a button whose text and color can change), `http_get_json(url)`, `http11_get(url, headers)` (HTTP/1.1 over TLS, returns status and body bytes), `wifi_connected()`, `clamp(...)`, and `clamp_y(angle)`.
 
 To give an app several views, as the Audio app does, put each view in its own `container(...)` and switch between them with `show(view, True/False)`.
 
@@ -314,6 +417,13 @@ To give an app several views, as the Audio app does, put each view in its own `c
 | **Interval buttons don't respond** | Check the console for `Photos: tap at X Y`. No line means the tap didn't register: taps are ignored while a photo is being fetched (1–3 s), and a finger that slides more than 15 px counts as a swipe. A line with coordinates outside the buttons means the touch position doesn't match the drawing; send me the line. |
 | **`M5IOE1 not found at I2C address 0x6F` at startup** | The StackChan body wasn't found. The app now retries `BODY_INIT_TRIES` times and then keeps running without the body (no LEDs, servos or battery data), printing "Continuing WITHOUT the StackChan body". If that keeps happening, check that the core is seated firmly on the body and that the body has power, then raise `BODY_INIT_WAIT_MS`. |
 | **Photos UI freezes for a second or two at each change** | That's the API call and image download, which block the loop. It only happens while Photos is visible. |
+| **Flights says "Network error"** | Check the console for the traceback. If the HTTP/1.1 client fails, try `FLIGHT_HTTP_CLIENT = "requests"`, and send me the console output. |
+| **Flights says "Bad location in CONFIG"** | adsb.lol returned 400. Check that `FLIGHT_LAT` is between -90 and 90 and `FLIGHT_LON` between -180 and 180. |
+| **Flights says "Rate limited, waiting"** | adsb.lol returned 429. The app waits `FLIGHT_RATE_LIMIT_RETRY_MS` (2 min). Raise `FLIGHT_REFRESH_MS` if it keeps happening. |
+| **"No planes within 10 nm"** | Normal at quiet times. Press **Range** for 25 nm, or set `FLIGHT_SHOW_GROUND = True` to include planes on the ground. |
+| **The head turns away from the plane** | Set `HEAD_PAN_SIGN = -1`. If it's off by a fixed angle instead, `FACING_DEG` is wrong. |
+| **The Head button says "Head: n/a"** | The StackChan body wasn't found at startup, so the servos can't move. |
+| **Flights freezes for a second or two every 15 s** | That's the adsb.lol request, which blocks the loop. It only happens while Flights is visible. Raise `FLIGHT_REFRESH_MS` if it bothers you. |
 
 ## Known limitations and ideas
 
@@ -324,4 +434,6 @@ To give an app several views, as the Audio app does, put each view in its own `c
 - Photo Frame mixes M5GFX drawing with LVGL on its page, which M5Stack advises against. It works by keeping LVGL from drawing anything visible there.
 - Photo Frame ideas: tap the photo to skip to the next one, remember the chosen interval across restarts, or dim the screen at night using the clock app's time.
 - The battery percentage is estimated from voltage and isn't a fuel gauge.
+- Flights blocks the loop for each request (1–3 s every 15 s). It has no origin or destination either: ADS-B doesn't carry routes, so that would need a second lookup.
+- Flights ideas: show the airline name from the callsign prefix, play a chime when a plane passes nearly overhead, or remember the chosen range across restarts.
 - Future app ideas: battery and servo power monitor, NFC mood cards, IR remote, face tracking, and a "talk to my MCP server" screen.
